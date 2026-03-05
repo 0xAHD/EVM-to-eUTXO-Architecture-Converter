@@ -1,0 +1,17 @@
+{
+  "name": "evm-eutxo-converter",
+  "private": true,
+  "version": "0.1.0",
+  "description": "EVM → eUTXO Architecture Converter",
+  "scripts": {
+    "dev": "pnpm --parallel -r run dev",
+    "build": "pnpm -r run build",
+    "test": "pnpm -r run test",
+    "lint": "eslint . --ext .ts,.tsx",
+    "format": "prettier --write \"**/*.{ts,tsx,json,md}\""
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "packageManager": "pnpm@9.1.0"
+}
