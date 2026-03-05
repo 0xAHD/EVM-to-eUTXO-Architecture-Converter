@@ -38,7 +38,7 @@ evm-eutxo-converter/
 2. **Transaction Flows** — UTXO input/output tables, redeemers, datum transitions per function
 3. **Component Diagram** — ASCII architecture diagram
 4. **Implementation Checklist** — step-by-step Cardano implementation guide
-5. **Aiken codebase equivalent to the EVM contract, with a code quality score
+5. **Aiken codebase** equivalent to the EVM contract, with a code quality score
 6. **Warnings** — concurrency, datum size, loops, access control, upgradeability
 
 ### Detected Patterns
