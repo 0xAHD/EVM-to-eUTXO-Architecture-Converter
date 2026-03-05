@@ -1,6 +1,6 @@
 # EVM → eUTXO Architecture Converter
 
-A local web app + API that takes an EVM-first project description (Solidity code, ABI, or text) and outputs an equivalent **Cardano eUTXO architecture plan** with transaction flows, datum/redeemer/state mapping, and recommended off-chain components.
+A local web app + API that takes an EVM-first project description (Solidity code, ABI, or text) and outputs an equivalent **Cardano eUTXO architecture plan or AIKEN equivalent** with transaction flows, datum/redeemer/state mapping, and recommended off-chain components.
 
 ## Quick Start
 
@@ -38,7 +38,8 @@ evm-eutxo-converter/
 2. **Transaction Flows** — UTXO input/output tables, redeemers, datum transitions per function
 3. **Component Diagram** — ASCII architecture diagram
 4. **Implementation Checklist** — step-by-step Cardano implementation guide
-5. **Warnings** — concurrency, datum size, loops, access control, upgradeability
+5. **Aiken codebase equivalent to the EVM contract, with a code quality score
+6. **Warnings** — concurrency, datum size, loops, access control, upgradeability
 
 ### Detected Patterns
 - **ERC20** — balances mapping, transfer/approve, Transfer/Approval events
