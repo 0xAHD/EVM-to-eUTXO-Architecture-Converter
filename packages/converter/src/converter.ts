@@ -68,8 +68,9 @@ function buildStateMappings(patterns: DetectedPattern[], options: ConvertOptions
       },
       {
         evmComponent: 'totalSupply (uint256)',
-        eutxoEquivalent: 'State thread UTXO datum field OR off-chain indexed sum',
-        notes: 'Can be tracked via a state UTXO if on-chain enforcement is needed.',
+        eutxoEquivalent: 'Off-chain indexed sum OR optional state-thread datum field (only if on-chain enforcement needed)',
+        notes:
+          'Most Cardano native tokens do not store total supply in datum; it can be computed from chain data. Use state-thread only if you truly need on-chain supply rules.',
       },
     );
   }
@@ -93,14 +94,25 @@ function buildStateMappings(patterns: DetectedPattern[], options: ConvertOptions
   if (kinds.has('Escrow')) {
     mappings.push(
       {
-        evmComponent: 'Escrow contract state (depositor, beneficiary, amount)',
-        eutxoEquivalent: 'Script UTXO holding escrowed funds with datum { depositor, beneficiary, deadline, status }',
-        notes: 'Each escrow instance = one UTXO at the script address.',
+        evmComponent: 'Escrow contract state (buyer/seller/depositor/beneficiary, amount, deadline, status)',
+        eutxoEquivalent:
+          'Per-instance Script UTXO holding escrowed funds with datum { buyer, seller, amount, deadline, status, (optional) fee params }',
+        notes:
+          'Each escrow/order instance = one UTXO at the script address. This scales concurrency naturally (many orders in parallel).',
       },
       {
-        evmComponent: 'deposit() / release() / refund() functions',
-        eutxoEquivalent: 'Three tx builder patterns, each using a specific Redeemer variant (Deposit | Release | Refund)',
-        notes: 'Validator checks the redeemer and datum transition rules.',
+        evmComponent: 'createOrder()/deposit() / release() / refund()',
+        eutxoEquivalent:
+          'Tx builder patterns: Create/Fund (creates script UTXO) + Release/Refund (spends script UTXO with redeemer)',
+        notes:
+          'Create/Fund usually creates the script output (no spending validator). Release/Refund spend the script UTXO and route funds.',
+      },
+      {
+        evmComponent: 'openDispute() / resolveDispute()',
+        eutxoEquivalent:
+          'Datum state-machine transitions: Active → Disputed → Resolved. Resolve checks arbiter/admin signature.',
+        notes:
+          'Dispute flows map nicely to eUTXO: keep funds in script UTXO until resolved.',
       },
     );
   }
@@ -135,12 +147,21 @@ function buildStateMappings(patterns: DetectedPattern[], options: ConvertOptions
       evmComponent: 'Solidity events (emit Transfer(...), etc.)',
       eutxoEquivalent:
         'Off-chain indexing of tx outputs + optional CIP-20 tx metadata for human-readable notes',
-      notes: 'Cardano has no event log. Use an off-chain indexer (e.g., Kupo, Ogmios, Blockfrost) to watch script UTXOs.',
+      notes:
+        'Cardano has no event log. Use an off-chain indexer (e.g., Kupo, Ogmios, Blockfrost) to watch script UTXOs.',
     });
   }
 
-  // Generic state variable mapping
-  if (options.assumptions.useNFTState) {
+  // Generic state variable mapping (GLOBAL STATE THREAD) — only when it makes sense.
+  // For escrow/lending we already model per-instance UTXOs, and for ERC20 transfers we use native tokens.
+  const kindsSet = kinds;
+  const usesGlobalStateUtxo =
+    options.assumptions.useNFTState &&
+    !kindsSet.has('Escrow') &&
+    !kindsSet.has('Lending') &&
+    !kindsSet.has('ERC20');
+
+  if (usesGlobalStateUtxo) {
     mappings.push({
       evmComponent: 'Contract storage (generic state variables)',
       eutxoEquivalent:
@@ -215,6 +236,7 @@ function buildOffChainServices(kinds: Set<string>, options: ConvertOptions): str
   }
   if (kinds.has('Escrow')) {
     services.push('Deadline monitoring service (watch for expiry to trigger refunds)');
+    services.push('Indexer queries for script UTXOs per-order (list open orders/disputes)');
   }
   services.push('Backend API (optional) to aggregate indexed data for the frontend');
 
@@ -242,7 +264,7 @@ function buildFolderStructure(kinds: Set<string>): string {
     '      tx-builders/',
   );
   if (kinds.has('ERC20')) lines.push('        transfer.ts', '        mint.ts');
-  if (kinds.has('Escrow')) lines.push('        deposit.ts', '        release.ts', '        refund.ts');
+  if (kinds.has('Escrow')) lines.push('        create.ts', '        release.ts', '        refund.ts', '        dispute.ts');
   if (kinds.has('Lending')) lines.push('        borrow.ts', '        repay.ts', '        liquidate.ts');
   lines.push(
     '      indexer/',
@@ -268,7 +290,7 @@ function buildFunctionFlows(
   const flows: FunctionFlow[] = [];
   const kinds = new Set(patterns.map((p) => p.kind));
 
-  // Extract function names from AST for enrichment
+  // Extract function names from AST for enrichment (kept for future use)
   const fnNames: string[] = [];
   if (ast) {
     visitAll(ast as ASTNode, (node) => {
@@ -279,10 +301,7 @@ function buildFunctionFlows(
   }
 
   if (kinds.has('ERC20')) {
-    flows.push(
-      buildERC20Transfer(options),
-      buildERC20Mint(options),
-    );
+    flows.push(buildERC20Transfer(options), buildERC20Mint(options));
   }
 
   if (kinds.has('Escrow')) {
@@ -290,15 +309,13 @@ function buildFunctionFlows(
       buildEscrowDeposit(),
       buildEscrowRelease(),
       buildEscrowRefund(),
+      buildEscrowOpenDispute(),
+      buildEscrowResolveDispute(),
     );
   }
 
   if (kinds.has('Lending')) {
-    flows.push(
-      buildLendingBorrow(),
-      buildLendingRepay(),
-      buildLendingLiquidate(),
-    );
+    flows.push(buildLendingBorrow(), buildLendingRepay(), buildLendingLiquidate());
   }
 
   return flows;
@@ -310,9 +327,7 @@ function buildERC20Transfer(_options: ConvertOptions): FunctionFlow {
   return {
     name: 'transfer',
     description: 'Transfer tokens from sender to recipient. On Cardano, this is a standard tx moving native assets.',
-    inputs: [
-      utxo('Sender wallet UTXO', 'sender addr', 'X tokens + ADA', 'N/A (wallet UTXO)'),
-    ],
+    inputs: [utxo('Sender wallet UTXO', 'sender addr', 'X tokens + ADA', 'N/A (wallet UTXO)')],
     outputs: [
       utxo('Recipient UTXO', 'recipient addr', 'Y tokens + min ADA', 'N/A'),
       utxo('Change UTXO', 'sender addr', '(X-Y) tokens + change ADA', 'N/A'),
@@ -332,19 +347,12 @@ function buildERC20Mint(_options: ConvertOptions): FunctionFlow {
   return {
     name: 'mint',
     description: 'Mint new tokens. Requires satisfying the minting policy validator.',
-    inputs: [
-      utxo('Minter wallet UTXO', 'minter addr', 'ADA for fees + min UTXO', 'N/A'),
-    ],
-    outputs: [
-      utxo('Minter receives minted tokens', 'minter addr', 'newly minted tokens + ADA', 'N/A'),
-    ],
+    inputs: [utxo('Minter wallet UTXO', 'minter addr', 'ADA for fees + min UTXO', 'N/A')],
+    outputs: [utxo('Minter receives minted tokens', 'minter addr', 'newly minted tokens + ADA', 'N/A')],
     redeemer: 'MintRedeemer { amount: Int }',
     datumBefore: 'N/A (minting policy, not spending validator)',
     datumAfter: 'N/A',
-    failureCases: [
-      'Minting policy rejects (unauthorized minter)',
-      'Invalid amount (negative or zero)',
-    ],
+    failureCases: ['Minting policy rejects (unauthorized minter)', 'Invalid amount (negative or zero)'],
   };
 }
 
@@ -352,64 +360,75 @@ function buildERC20Mint(_options: ConvertOptions): FunctionFlow {
 
 function buildEscrowDeposit(): FunctionFlow {
   return {
-    name: 'deposit',
-    description: 'Depositor locks funds into the escrow script address.',
-    inputs: [
-      utxo('Depositor wallet UTXO', 'depositor addr', 'escrow amount + ADA', 'N/A'),
-    ],
+    name: 'create/fund',
+    description: 'Buyer/depositor locks funds into a per-order script UTXO at the escrow address.',
+    inputs: [utxo('Buyer wallet UTXO', 'buyer addr', 'escrow amount + ADA', 'N/A')],
     outputs: [
-      utxo('Escrow UTXO', 'script addr', 'escrowed ADA/tokens', '{ depositor, beneficiary, deadline, status: Active }'),
-      utxo('Change', 'depositor addr', 'remaining ADA', 'N/A'),
+      utxo(
+        'Order/Escrow UTXO',
+        'script addr',
+        'escrowed ADA/tokens',
+        '{ buyer, seller, amount, deadline, status: Active }',
+      ),
+      utxo('Change', 'buyer addr', 'remaining ADA', 'N/A'),
     ],
     redeemer: 'N/A (creating new script UTXO, no spending validator invoked)',
     datumBefore: 'N/A (new UTXO)',
-    datumAfter: '{ depositor: PubKeyHash, beneficiary: PubKeyHash, deadline: POSIXTime, status: Active }',
-    failureCases: [
-      'Insufficient funds',
-      'Invalid datum fields (missing beneficiary)',
-    ],
+    datumAfter: '{ buyer: PubKeyHash, seller: PubKeyHash, deadline: POSIXTime, status: Active }',
+    failureCases: ['Insufficient funds', 'Invalid datum fields (missing seller)', 'Deadline not in future'],
   };
 }
 
 function buildEscrowRelease(): FunctionFlow {
   return {
     name: 'release',
-    description: 'Depositor or arbiter releases escrowed funds to the beneficiary.',
-    inputs: [
-      utxo('Escrow UTXO', 'script addr', 'escrowed funds', '{ ..., status: Active }'),
-    ],
-    outputs: [
-      utxo('Beneficiary receives funds', 'beneficiary addr', 'escrowed ADA/tokens', 'N/A'),
-    ],
+    description: 'Buyer/depositor releases escrowed funds to the seller/beneficiary.',
+    inputs: [utxo('Escrow UTXO', 'script addr', 'escrowed funds', '{ ..., status: Active }')],
+    outputs: [utxo('Seller receives funds', 'seller addr', 'escrowed ADA/tokens (minus optional fee)', 'N/A')],
     redeemer: 'Release',
-    datumBefore: '{ depositor, beneficiary, deadline, status: Active }',
-    datumAfter: 'N/A (UTXO consumed; beneficiary receives plain UTXO)',
-    failureCases: [
-      'Not signed by depositor/arbiter',
-      'Escrow already released or refunded',
-      'Deadline passed (if time-locked release)',
-    ],
+    datumBefore: '{ buyer, seller, amount, deadline, status: Active }',
+    datumAfter: 'N/A (UTXO consumed; seller receives plain UTXO)',
+    failureCases: ['Not signed by buyer/depositor (or arbiter/admin)', 'Escrow not Active', 'Wrong payout outputs'],
   };
 }
 
 function buildEscrowRefund(): FunctionFlow {
   return {
     name: 'refund',
-    description: 'Depositor reclaims funds after deadline passes.',
-    inputs: [
-      utxo('Escrow UTXO', 'script addr', 'escrowed funds', '{ ..., status: Active }'),
-    ],
-    outputs: [
-      utxo('Depositor gets refund', 'depositor addr', 'escrowed ADA/tokens', 'N/A'),
-    ],
+    description: 'Buyer/depositor reclaims funds after deadline passes (time-locked refund).',
+    inputs: [utxo('Escrow UTXO', 'script addr', 'escrowed funds', '{ ..., status: Active }')],
+    outputs: [utxo('Buyer gets refund', 'buyer addr', 'escrowed ADA/tokens', 'N/A')],
     redeemer: 'Refund',
-    datumBefore: '{ depositor, beneficiary, deadline, status: Active }',
+    datumBefore: '{ buyer, seller, amount, deadline, status: Active }',
     datumAfter: 'N/A (UTXO consumed)',
-    failureCases: [
-      'Deadline not yet reached (tx validity range check)',
-      'Not signed by depositor',
-      'Escrow already released',
-    ],
+    failureCases: ['Deadline not yet reached (tx validity range check)', 'Not signed by buyer/depositor', 'Escrow not Active'],
+  };
+}
+
+function buildEscrowOpenDispute(): FunctionFlow {
+  return {
+    name: 'openDispute',
+    description: 'Buyer or seller opens a dispute, transitioning the datum status to Disputed.',
+    inputs: [utxo('Escrow UTXO', 'script addr', 'escrowed funds', '{ ..., status: Active }')],
+    outputs: [utxo('Updated Escrow UTXO', 'script addr', 'escrowed funds', '{ ..., status: Disputed }')],
+    redeemer: 'OpenDispute',
+    datumBefore: '{ ..., status: Active }',
+    datumAfter: '{ ..., status: Disputed }',
+    failureCases: ['Not signed by buyer/seller (not a party)', 'Escrow not Active'],
+  };
+}
+
+function buildEscrowResolveDispute(): FunctionFlow {
+  return {
+    name: 'resolveDispute',
+    description:
+      'Arbiter/admin resolves dispute and routes funds to winner (buyer or seller). Funds leave the script.',
+    inputs: [utxo('Escrow UTXO', 'script addr', 'escrowed funds', '{ ..., status: Disputed }')],
+    outputs: [utxo('Winner receives funds', 'buyer or seller addr', 'escrowed funds (minus optional fee)', 'N/A')],
+    redeemer: 'ResolveDispute { paySeller: Bool }',
+    datumBefore: '{ ..., status: Disputed }',
+    datumAfter: 'N/A (UTXO consumed)',
+    failureCases: ['Not signed by arbiter/admin', 'Escrow not Disputed', 'Wrong payout outputs'],
   };
 }
 
@@ -424,18 +443,19 @@ function buildLendingBorrow(): FunctionFlow {
       utxo('Lending pool UTXO', 'script addr', 'available liquidity', '{ poolState }'),
     ],
     outputs: [
-      utxo('Collateral locked UTXO', 'script addr', 'collateral', '{ borrower, collateral, principal, rate, status: Active }'),
+      utxo(
+        'Collateral locked UTXO',
+        'script addr',
+        'collateral',
+        '{ borrower, collateral, principal, rate, status: Active }',
+      ),
       utxo('Borrower receives loan', 'borrower addr', 'loan tokens', 'N/A'),
       utxo('Updated pool UTXO', 'script addr', 'reduced liquidity', '{ updatedPoolState }'),
     ],
     redeemer: 'Borrow { amount: Int, collateralAmount: Int }',
     datumBefore: '{ poolState: { totalLiquidity, ... } }',
     datumAfter: '{ poolState: { totalLiquidity - amount, ... } } + new loan datum',
-    failureCases: [
-      'Insufficient collateral ratio',
-      'Pool has insufficient liquidity',
-      'Oracle price feed missing or stale',
-    ],
+    failureCases: ['Insufficient collateral ratio', 'Pool has insufficient liquidity', 'Oracle price feed missing or stale'],
   };
 }
 
@@ -454,11 +474,7 @@ function buildLendingRepay(): FunctionFlow {
     redeemer: 'Repay { loanId: ByteString }',
     datumBefore: '{ borrower, collateral, principal, rate, status: Active }',
     datumAfter: 'Loan UTXO consumed; pool datum updated with returned liquidity',
-    failureCases: [
-      'Insufficient repayment amount',
-      'Loan already liquidated',
-      'Not signed by borrower',
-    ],
+    failureCases: ['Insufficient repayment amount', 'Loan already liquidated', 'Not signed by borrower'],
   };
 }
 
@@ -477,11 +493,7 @@ function buildLendingLiquidate(): FunctionFlow {
     redeemer: 'Liquidate { loanId: ByteString }',
     datumBefore: '{ borrower, collateral, principal, rate, status: Active }',
     datumAfter: 'Loan UTXO consumed; pool datum updated',
-    failureCases: [
-      'Collateral ratio still healthy (not under-collateralized)',
-      'Oracle price unavailable',
-      'Loan already repaid or liquidated',
-    ],
+    failureCases: ['Collateral ratio still healthy (not under-collateralized)', 'Oracle price unavailable', 'Loan already repaid or liquidated'],
   };
 }
 
@@ -503,11 +515,18 @@ function buildDiagram(kinds: Set<string>, options: ConvertOptions): string {
     '                                                   │',
   ];
 
-  if (options.assumptions.useNFTState) {
+  // Only show a global state-thread NFT box if we actually use it for global shared state.
+  const usesGlobalStateUtxo =
+    options.assumptions.useNFTState &&
+    !kinds.has('Escrow') &&
+    !kinds.has('Lending') &&
+    !kinds.has('ERC20');
+
+  if (usesGlobalStateUtxo) {
     lines.push(
       '                      ┌───────────────┐            │',
       '                      │  State UTXO   │◀───────────┘',
-      '                      │  (NFT thread)  │',
+      '                      │ (NFT thread)  │',
       '                      └───────────────┘',
     );
   }
@@ -546,7 +565,13 @@ function buildChecklist(kinds: Set<string>, options: ConvertOptions): string[] {
     items.push('[ ] Register token metadata (CIP-25 / CIP-68)');
   }
 
-  if (options.assumptions.useNFTState) {
+  const usesGlobalStateUtxo =
+    options.assumptions.useNFTState &&
+    !kinds.has('Escrow') &&
+    !kinds.has('Lending') &&
+    !kinds.has('ERC20');
+
+  if (usesGlobalStateUtxo) {
     items.push('[ ] Mint state thread NFT for concurrency control');
   }
 
@@ -562,6 +587,7 @@ function buildChecklist(kinds: Set<string>, options: ConvertOptions): string[] {
   }
 
   if (kinds.has('Escrow')) {
+    items.push('[ ] Implement dispute flow tx builders (open/resolve)');
     items.push('[ ] Implement deadline monitoring service');
   }
 
@@ -576,7 +602,14 @@ function buildChecklist(kinds: Set<string>, options: ConvertOptions): string[] {
 function buildWarnings(kinds: Set<string>, options: ConvertOptions): string[] {
   const warnings: string[] = [];
 
-  if (options.assumptions.useNFTState) {
+  // Only warn about single state-thread UTXO when we are *actually* modeling global shared state that way.
+  const usesGlobalStateUtxo =
+    options.assumptions.useNFTState &&
+    !kinds.has('Escrow') &&
+    !kinds.has('Lending') &&
+    !kinds.has('ERC20');
+
+  if (usesGlobalStateUtxo) {
     warnings.push(
       '⚠️ CONCURRENCY: Using a single state UTXO creates a concurrency bottleneck — only one tx can consume it per block. Consider splitting state across multiple UTXOs or using off-chain batching.',
     );
@@ -628,7 +661,6 @@ function buildWarnings(kinds: Set<string>, options: ConvertOptions): string[] {
 function computeConfidence(patterns: DetectedPattern[]): number {
   if (patterns.length === 0) return 0;
   const avg = patterns.reduce((sum, p) => sum + p.confidence, 0) / patterns.length;
-  // Scale by number of patterns detected (more patterns = higher confidence, capped)
   const coverage = Math.min(patterns.length / 5, 1);
   return Math.round(avg * 0.7 + coverage * 0.3 * 100) / 100;
 }
